@@ -467,6 +467,1401 @@ function loadState() {
       if (!s.history) s.history = {};
       if (!s.lastActiveDate) s.lastActiveDate = todayKey();
       if (!s.metrics || !s.metrics.current) s.metrics = JSON.parse(JSON.stringify(DEFAULT_METRICS));
+      // Defensive fallbacks for incomplete/legacy data
+      if (!Array.isArray(s.plans) || s.plans.length === 0) s.plans = JSON.parse(JSON.stringify(DEFAULT_PLANS));
+      if (!Array.isArray(s.customPlans)) s.customPlans = [];
+      if (!s.meals || !s.meals.breakfast || !s.meals.breakfast.items) s.meals = JSON.parse(JSON.stringify(DEFAULT_MEALS));
+      if (!s.currentPlanId) s.currentPlanId = 'ppl';
+      if (typeof s.currentDayIdx !== 'number' || s.currentDayIdx < 0) s.currentDayIdx = 0;
+      if (!s.selectedMealType) s.selectedMealType = 'breakfast';
+      if (typeof s.water !== 'number') s.water = 0;
+      return s;
+    }
+  } catch(e) { console.warn('load state failed', e); }
+  return defaultState();
+}
+
+function defaultState() {
+  return {
+    water: 0,
+    waterGoal: DEFAULT_WATER_GOAL,
+    goalWeight: DEFAULT_GOAL_WEIGHT,
+    currentPlanId: 'ppl',
+    currentDayIdx: 0,
+    plans: JSON.parse(JSON.stringify(DEFAULT_PLANS)),
+    customPlans: [],
+    meals: JSON.parse(JSON.stringify(DEFAULT_MEALS)),
+    metrics: JSON.parse(JSON.stringify(DEFAULT_METRICS)),
+    selectedMealType: 'breakfast',
+    history: {},
+    lastActiveDate: todayKey()
+  };
+}
+
+// ==================== DAILY RESET & HISTORY ====================
+function checkDailyReset() {
+  const today = todayKey();
+  if (state.lastActiveDate !== today) {
+    // Archive previous day's data to history
+    archiveDay(state.lastActiveDate);
+    // Reset daily data
+    state.water = 0;
+    state.meals = JSON.parse(JSON.stringify(DEFAULT_MEALS));
+    // Reset exercise done states
+    const allPlans = getAllPlans();
+    allPlans.forEach(p => {
+      if (p.days) p.days.forEach(d => d.exercises.forEach(e => { e.done = false; }));
+    });
+    // Rotate training day
+    const plan = allPlans.find(p => p.id === state.currentPlanId);
+    if (plan && plan.days && plan.days.length > 0) {
+      state.currentDayIdx = (state.currentDayIdx + 1) % plan.days.length;
+    }
+    state.lastActiveDate = today;
+    saveState();
+  }
+  // Also archive current day if there's training data (for live stats)
+  recordTodayToHistory();
+}
+
+function archiveDay(dateStr) {
+  if (!state.history[dateStr]) {
+    state.history[dateStr] = { trained: 0, burn: 0, intake: 0, water: 0, planId: '', dayName: '' };
+  }
+  const h = state.history[dateStr];
+  // 训练状态已在当天由 recordTodayToHistory() 实时写入 history，
+  // 跨日归档时保留该值，避免用空动作列表误清零（历史动作无法跨日恢复）。
+  // 摄入/饮水：若当天有实时记录则保留，否则用当前 state（仍是昨日数据）兜底。
+  if (!h.intake) h.intake = getTotalIntake();
+  if (!h.water) h.water = state.water * 250;
+  const plan = getAllPlans().find(p => p.id === state.currentPlanId);
+  if (plan && plan.days) {
+    const day = plan.days[state.currentDayIdx % plan.days.length];
+    h.planId = state.currentPlanId;
+    h.dayName = day ? day.name : '';
+  }
+}
+
+function recordTodayToHistory() {
+  const today = todayKey();
+  if (!state.history[today]) {
+    state.history[today] = { trained: 0, burn: 0, intake: 0, water: 0, planId: '', dayName: '' };
+  }
+  const h = state.history[today];
+  const exs = getCurrentExercises();
+  const completedExs = exs.filter(e => e.done);
+  h.trained = completedExs.length > 0 ? 1 : 0;
+  h.burn = estimateBurn(completedExs);
+  h.intake = getTotalIntake();
+  h.water = state.water * 250;
+  const plan = getAllPlans().find(p => p.id === state.currentPlanId);
+  if (plan && plan.days) {
+    const day = plan.days[state.currentDayIdx % plan.days.length];
+    h.planId = state.currentPlanId;
+    h.dayName = day ? day.name : '';
+  }
+}
+
+function estimateBurn(exercises) {
+  if (!exercises || exercises.length === 0) return 0;
+  let total = 0;
+  exercises.forEach(ex => {
+    const m = /(\d+(\.\d+)?)/.exec(ex.meta || '');
+    const kg = m ? parseFloat(m[1]) : 20;
+    total += 30 + Math.min(kg, 100) * 0.6;
+  });
+  return Math.round(total);
+}
+
+function saveState() {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
+  catch(e) { console.warn('save state failed', e); }
+}
+
+// ==================== THEME ====================
+function initTheme() {
+  const saved = localStorage.getItem(THEME_KEY) || 'light';
+  setTheme(saved);
+}
+
+function setTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  localStorage.setItem(THEME_KEY, theme);
+  const btn = document.getElementById('themeBtn');
+  if (btn) btn.innerHTML = theme === 'dark'
+    ? '<svg class="top__theme-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>'
+    : '<svg class="top__theme-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+}
+
+function toggleTheme() {
+  const current = document.documentElement.getAttribute('data-theme');
+  setTheme(current === 'dark' ? 'light' : 'dark');
+}
+
+// ==================== INIT ====================
+function initDate() {
+  const now = new Date();
+  const m = now.getMonth() + 1, d = now.getDate();
+  const days = ['周日','周一','周二','周三','周四','周五','周六'];
+  document.getElementById('topDate').textContent = m + '\u6708' + d + '\u65E5';
+  document.getElementById('topDay').textContent = days[now.getDay()];
+}
+
+function init() {
+  initTheme();
+  checkDailyReset();
+  initDate();
+  renderAll();
+  // First-time onboarding: ask for body metrics if never set
+  if (!state.metrics || !state.metrics.current) {
+    setTimeout(() => {
+      openM('mdlMetric');
+      toast('\u8BF7\u5148\u8BB0\u5F55\u4F60\u7684\u8EAB\u4F53\u6570\u636E');
+    }, 300);
+  }
+}
+
+function renderAll() {
+  renderExList();
+  renderMealList();
+  renderPlanList();
+  renderMetrics();
+  updateWater(false);
+  updateIntake();
+  updateBurn();
+  updateGoalWeightHint();
+  updateWaterGoalDisplay();
+}
+
+// ==================== GOAL (weight-based) ====================
+function getRecommendedCals() {
+  const cur = (state.metrics.current && state.metrics.current.weight)
+    ? state.metrics.current.weight
+    : state.goalWeight;
+  const target = state.goalWeight;
+  const diff = target - cur;
+  let base = Math.round(cur * 28);
+  if (diff < -1) base -= 400;
+  else if (diff > 1) base += 400;
+  return Math.max(1200, base);
+}
+
+function saveGoalWeight() {
+  const val = parseFloat(document.getElementById('goalWeightInput').value);
+  if (isNaN(val) || val < 30 || val > 200) { toast('\u8BF7\u8F93\u5165\u6709\u6548\u4F53\u91CD (30-200kg)'); return; }
+  state.goalWeight = val;
+  saveState();
+  updateGoalWeightHint();
+  updateIntake();
+  toast('\u76EE\u6807\u4F53\u91CD\u5DF2\u8BBE\u7F6E\u4E3A ' + val + ' kg');
+}
+
+function updateGoalWeightHint() {
+  const cur = state.metrics.current ? state.metrics.current.weight : null;
+  const target = state.goalWeight;
+  const input = document.getElementById('goalWeightInput');
+  if (input) input.value = target;
+  const hint = document.getElementById('goalWeightHint');
+  if (!hint) return;
+  if (cur == null) {
+    hint.textContent = '\u8BF7\u5148\u8BB0\u5F55\u5F53\u524D\u4F53\u91CD\uFF0C\u83B7\u53D6\u4E2A\u6027\u5316\u51CF\u8102\u5EFA\u8BAE';
+    return;
+  }
+  const diff = target - cur;
+  const recCals = getRecommendedCals();
+  const diffStr = diff > 0 ? '+' + diff.toFixed(1) : diff.toFixed(1);
+  hint.textContent = '\u5F53\u524D ' + cur.toFixed(1) + ' kg \u2192 \u76EE\u6807 ' + target.toFixed(1) + ' kg (' + diffStr + ' kg) \u00b7 \u5EFA\u8BAE ' + recCals.toLocaleString() + ' kcal/\u5929';
+}
+
+// ==================== WATER ====================
+function changeWater(delta) {
+  const maxCups = Math.ceil(state.waterGoal / 250);
+  state.water = Math.max(0, Math.min(maxCups, state.water + delta));
+  saveState();
+  recordTodayToHistory();
+  updateWater(true);
+  updateIntake();
+}
+
+function updateWater(animate) {
+  const ml = state.water * 250;
+  const maxCups = Math.ceil(state.waterGoal / 250);
+  const pct = Math.min(100, state.water / maxCups * 100);
+  document.getElementById('waterBar').style.width = pct + '%';
+  document.getElementById('waterVal').textContent = ml.toLocaleString();
+  document.getElementById('waterNum').textContent = ml.toLocaleString();
+}
+
+function saveWaterGoal() {
+  const val = parseInt(document.getElementById('waterGoalInput').value);
+  if (isNaN(val) || val < 500 || val > 5000) { toast('\u8BF7\u8F93\u5165\u6709\u6548\u996E\u6C34\u76EE\u6807 (500-5000ml)'); return; }
+  state.waterGoal = val;
+  saveState();
+  updateWaterGoalDisplay();
+  updateWater(false);
+  toast('\u996E\u6C34\u76EE\u6807\u5DF2\u8BBE\u7F6E\u4E3A ' + val + ' ml');
+}
+
+function updateWaterGoalDisplay() {
+  const goalEl = document.getElementById('waterGoal');
+  if (goalEl) goalEl.textContent = 'ml / ' + state.waterGoal.toLocaleString();
+  const inputEl = document.getElementById('waterGoalInput');
+  if (inputEl) inputEl.value = state.waterGoal;
+}
+
+// ==================== EXERCISES ====================
+function getCurrentExercises() {
+  const plan = getAllPlans().find(p => p.id === state.currentPlanId);
+  if (!plan || !plan.days || plan.days.length === 0) return [];
+  const day = plan.days[state.currentDayIdx % plan.days.length];
+  return day ? day.exercises : [];
+}
+
+function getAllPlans() {
+  return [...state.plans, ...state.customPlans];
+}
+
+function renderExList() {
+  const list = document.getElementById('exList');
+  const exs = getCurrentExercises();
+  const plan = getAllPlans().find(p => p.id === state.currentPlanId);
+  if (plan && plan.days && plan.days.length > 0) {
+    const day = plan.days[state.currentDayIdx % plan.days.length];
+    document.getElementById('planLabel').textContent = day.name;
+  }
+  if (exs.length === 0) {
+    list.innerHTML = '<div style="padding:20px 0;text-align:center;color:var(--muted);font-size:12px">\u6682\u65E0\u8BAD\u7EC3\u52A8\u4F5C\uFF0C\u70B9\u51FB + \u6DFB\u52A0</div>';
+    return;
+  }
+  list.innerHTML = exs.map((ex, i) => `
+    <div class="item" onclick="toggleEx(${i})">
+      <span class="item__name ${ex.done?'done':''}">${esc(ex.name)}</span>
+      <span class="item__meta">${esc(ex.meta)}</span>
+      <button class="item__del" onclick="event.stopPropagation();delEx(${i})">\u5220\u9664</button>
+      <div class="item__check ${ex.done?'done':''}"></div>
+    </div>
+  `).join('');
+}
+
+function toggleEx(idx) {
+  const exs = getCurrentExercises();
+  if (exs[idx]) {
+    exs[idx].done = !exs[idx].done;
+    saveState();
+    recordTodayToHistory();
+    renderExList();
+    updateBurn();
+  }
+}
+
+function delEx(idx) {
+  const exs = getCurrentExercises();
+  if (exs[idx]) {
+    const name = exs[idx].name;
+    exs.splice(idx, 1);
+    saveState();
+    recordTodayToHistory();
+    renderExList();
+    updateBurn();
+    toast('\u5DF2\u5220\u9664: ' + name);
+  }
+}
+
+function addEx() {
+  const name = document.getElementById('exName').value.trim();
+  const wt = document.getElementById('exWt').value;
+  const sets = document.getElementById('exSets').value;
+  if (!name) { toast('\u8BF7\u8F93\u5165\u52A8\u4F5C\u540D\u79F0'); return; }
+  const meta = (wt && sets) ? wt + 'kg\u00d7' + sets : (wt ? wt + 'kg' : (sets ? sets + '\u7EC4' : '\u81EA\u5B9A\u4E49'));
+  const plan = getAllPlans().find(p => p.id === state.currentPlanId);
+  if (plan && plan.days && plan.days.length > 0) {
+    plan.days[state.currentDayIdx % plan.days.length].exercises.push({ name, meta, done: false });
+    saveState();
+    recordTodayToHistory();
+    renderExList();
+  }
+  document.getElementById('exName').value = '';
+  closeM('mdlEx');
+  toast('\u5DF2\u6DFB\u52A0: ' + name);
+}
+
+// ==================== TRAINING DAY SWITCHER ====================
+function switchDay(delta) {
+  const plan = getAllPlans().find(p => p.id === state.currentPlanId);
+  if (!plan || !plan.days || plan.days.length === 0) return;
+  state.currentDayIdx = (state.currentDayIdx + delta + plan.days.length) % plan.days.length;
+  saveState();
+  renderExList();
+  updateBurn();
+  const day = plan.days[state.currentDayIdx];
+  toast('\u5207\u6362\u5230: ' + day.name);
+}
+
+// ==================== CALORIES BURN ====================
+function getCompletedExercises() {
+  return getCurrentExercises().filter(e => e.done);
+}
+
+function updateBurn() {
+  const burn = estimateBurn(getCompletedExercises());
+  document.getElementById('burnNum').textContent = burn.toLocaleString();
+}
+
+// ==================== MEALS ====================
+function getTotalMealCals(items) {
+  return items.reduce((s, i) => s + i.cal, 0);
+}
+
+function getTotalIntake() {
+  return Object.values(state.meals).reduce((s, m) => s + getTotalMealCals(m.items), 0);
+}
+
+function renderMealList() {
+  const list = document.getElementById('mealList');
+  const types = ['breakfast','lunch','dinner','snack'];
+  list.innerHTML = types.map(t => {
+    const m = state.meals[t];
+    const total = getTotalMealCals(m.items);
+    return `
+      <div class="item" onclick="showMealDetail('${t}')" style="cursor:pointer">
+        <span class="item__name">${esc(m.name)}</span>
+        <span class="item__meta" style="${total===0?'color:var(--muted)':''}">${total===0?'\u2014':total}</span>
+      </div>
+    `;
+  }).join('');
+}
+
+function updateIntake() {
+  const total = getTotalIntake();
+  const goal = getRecommendedCals();
+  document.getElementById('intakeNum').textContent = total.toLocaleString();
+  document.getElementById('intakeLbl').textContent = '\u6444\u5165/' + goal.toLocaleString();
+  const pct = Math.min(100, total / goal * 100);
+  const bar = document.getElementById('intakeBar');
+  if (bar) bar.style.width = pct + '%';
+  // Record to history
+  recordTodayToHistory();
+}
+
+function showMealDetail(type) {
+  const m = state.meals[type];
+  if (!m) return;
+  document.getElementById('mealTitle').textContent = m.name;
+  let html = '';
+  if (m.items.length === 0) {
+    html = '<div style="text-align:center;padding:32px 0;color:var(--muted);font-size:14px">\u8FD8\u6CA1\u6709\u8BB0\u5F55\uFF0C\u70B9\u51FB + \u6DFB\u52A0\u98DF\u7269</div>';
+  } else {
+    let total = 0;
+    m.items.forEach((item, idx) => {
+      total += item.cal;
+      html += `<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--rule)">
+        <div><div style="font-size:15px">${esc(item.name)}</div><div style="font-size:12px;color:var(--muted);margin-top:2px">${esc(item.sub||'')}</div></div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <div style="font-size:14px;font-weight:600;color:var(--accent)">${item.cal} kcal</div>
+          <button onclick="event.stopPropagation();delMealItem('${type}',${idx})" style="font-size:12px;color:var(--danger)">\u5220\u9664</button>
+        </div>
+      </div>`;
+    });
+    html += `<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 0;font-weight:600"><span>\u5408\u8BA1</span><span style="font-size:14px">${total} kcal</span></div>`;
+  }
+  document.getElementById('mealItems').innerHTML = html;
+  openM('mdlMeal');
+}
+
+function delMealItem(type, idx) {
+  state.meals[type].items.splice(idx, 1);
+  saveState();
+  showMealDetail(type);
+  renderMealList();
+  updateIntake();
+}
+
+function selectMealType(el) {
+  document.querySelectorAll('#mealTypeSel div').forEach(d => {
+    d.style.background = 'transparent';
+    d.style.color = 'var(--muted)';
+    delete d.dataset.active;
+  });
+  el.style.background = 'var(--bg)';
+  el.style.color = 'var(--text)';
+  el.dataset.active = '1';
+  state.selectedMealType = el.dataset.type;
+  saveState();
+}
+
+function getSelectedMealType() {
+  const active = document.querySelector('#mealTypeSel div[data-active]');
+  return active ? active.dataset.type : (state.selectedMealType || 'breakfast');
+}
+
+let pickedFoods = [];
+
+function openFoodModal() {
+  pickedFoods = [];
+  document.querySelectorAll('#foodPickList .meal-row').forEach(r => {
+    r.classList.remove('picked');
+    r.style.background = '';
+    r.style.color = '';
+    const cals = r.querySelector('.meal-row__cals');
+    if (cals) cals.style.color = '';
+  });
+  document.getElementById('foodPickSummary').textContent = '';
+  document.getElementById('manualFoodName').value = '';
+  document.getElementById('manualFoodCal').value = '';
+  // Restore selected meal type
+  if (state.selectedMealType) {
+    document.querySelectorAll('#mealTypeSel div').forEach(d => {
+      if (d.dataset.type === state.selectedMealType) {
+        d.style.background = 'var(--bg)';
+        d.style.color = 'var(--text)';
+        d.dataset.active = '1';
+      } else {
+        d.style.background = 'transparent';
+        d.style.color = 'var(--muted)';
+        delete d.dataset.active;
+      }
+    });
+  }
+  openM('mdlFood');
+}
+
+function toggleFoodPick(el, name, cal) {
+  el.classList.toggle('picked');
+  if (el.classList.contains('picked')) {
+    el.style.background = 'var(--text)';
+    el.style.color = 'var(--bg)';
+    el.querySelector('.meal-row__cals').style.color = 'rgba(255,255,255,.6)';
+    pickedFoods.push({ name, cal });
+  } else {
+    el.style.background = '';
+    el.style.color = '';
+    el.querySelector('.meal-row__cals').style.color = '';
+    pickedFoods = pickedFoods.filter(f => f.name !== name);
+  }
+  updateFoodPickSummary();
+}
+
+function updateFoodPickSummary() {
+  const summary = document.getElementById('foodPickSummary');
+  if (pickedFoods.length === 0) {
+    summary.textContent = '';
+  } else {
+    const total = pickedFoods.reduce((s, f) => s + f.cal, 0);
+    summary.textContent = '\u5DF2\u9009 ' + pickedFoods.length + ' \u9879 \u00b7 \u5171 ' + total + ' kcal';
+  }
+}
+
+function confirmAddFood() {
+  const manualName = document.getElementById('manualFoodName').value.trim();
+  const manualCal = parseInt(document.getElementById('manualFoodCal').value);
+  if (manualName) {
+    if (isNaN(manualCal) || manualCal < 0) { toast('\u8BF7\u8F93\u5165\u6709\u6548\u70ED\u91CF'); return; }
+    pickedFoods.push({ name: manualName, cal: manualCal });
+  }
+  if (pickedFoods.length === 0) { toast('\u8BF7\u9009\u62E9\u6216\u8F93\u5165\u98DF\u7269'); return; }
+  const type = getSelectedMealType();
+  const labels = { breakfast: '\u65E9\u9910', lunch: '\u5348\u9910', dinner: '\u665A\u9910', snack: '\u52A0\u9910' };
+  pickedFoods.forEach(f => {
+    state.meals[type].items.push({ name: f.name, sub: '\u7EA6100g', cal: f.cal });
+  });
+  saveState();
+  renderMealList();
+  updateIntake();
+  toast('\u5DF2\u6DFB\u52A0\u5230' + (labels[type]||'') + ': ' + pickedFoods.length + ' \u9879');
+  pickedFoods = [];
+  closeM('mdlFood');
+}
+
+// ==================== METRICS ====================
+function renderMetrics() {
+  const cur = state.metrics.current;
+  const wEl = document.getElementById('weightVal');
+  if (!cur) {
+    wEl.textContent = '--';
+    document.getElementById('bodyFatVal').textContent = '--';
+    document.getElementById('muscleVal').textContent = '--';
+    document.getElementById('weightDiff').textContent = '';
+    document.getElementById('bodyFatDiff').textContent = '';
+    document.getElementById('muscleDiff').textContent = '';
+    document.getElementById('mWeight').value = '';
+    document.getElementById('mBodyFat').value = '';
+    document.getElementById('mMuscle').value = '';
+    const wcEl = document.getElementById('weightChange');
+    if (wcEl) wcEl.textContent = '--';
+    updateGoalWeightHint();
+    updateIntake();
+    return;
+  }
+  const prev = state.metrics.previous || cur;
+  wEl.textContent = cur.weight.toFixed(1);
+  document.getElementById('bodyFatVal').textContent = cur.bodyFat.toFixed(1);
+  document.getElementById('muscleVal').textContent = cur.muscle.toFixed(1);
+  const wd = (cur.weight - prev.weight);
+  const bd = (cur.bodyFat - prev.bodyFat);
+  const md = (cur.muscle - prev.muscle);
+  document.getElementById('weightDiff').textContent = (wd>0?'+':'') + wd.toFixed(1);
+  document.getElementById('weightDiff').style.color = wd < 0 ? 'var(--accent)' : 'var(--muted)';
+  document.getElementById('bodyFatDiff').textContent = (bd>0?'+':'') + bd.toFixed(1);
+  document.getElementById('bodyFatDiff').style.color = bd < 0 ? 'var(--accent)' : 'var(--muted)';
+  document.getElementById('muscleDiff').textContent = (md>0?'+':'') + md.toFixed(1);
+  document.getElementById('muscleDiff').style.color = md > 0 ? 'var(--accent)' : 'var(--muted)';
+  // Progress page weight change (total from initial)
+  const initW = state.metrics.initial ? state.metrics.initial.weight : prev.weight;
+  const totalWd = cur.weight - initW;
+  const wcEl = document.getElementById('weightChange');
+  if (wcEl) wcEl.textContent = (totalWd>0?'+':'') + totalWd.toFixed(1) + ' kg';
+  // Populate modal inputs
+  document.getElementById('mWeight').value = cur.weight;
+  document.getElementById('mBodyFat').value = cur.bodyFat;
+  document.getElementById('mMuscle').value = cur.muscle;
+  updateGoalWeightHint();
+  updateIntake();
+}
+
+function saveMetric() {
+  const w = parseFloat(document.getElementById('mWeight').value);
+  const b = parseFloat(document.getElementById('mBodyFat').value);
+  const m = parseFloat(document.getElementById('mMuscle').value);
+  if (isNaN(w) || isNaN(b) || isNaN(m)) { toast('\u8BF7\u8F93\u5165\u6709\u6548\u6570\u503C'); return; }
+  if (!state.metrics || !state.metrics.current) {
+    // First-time setup: record as baseline
+    state.metrics = {
+      current: { weight: w, bodyFat: b, muscle: m },
+      previous: null,
+      initial: { weight: w, bodyFat: b, muscle: m }
+    };
+  } else {
+    state.metrics.previous = { ...state.metrics.current };
+    state.metrics.current = { weight: w, bodyFat: b, muscle: m };
+  }
+  saveState();
+  renderMetrics();
+  closeM('mdlMetric');
+  toast('\u8EAB\u4F53\u6570\u636E\u5DF2\u4FDD\u5B58');
+}
+
+// ==================== PLANS ====================
+function renderPlanList() {
+  const list = document.getElementById('planList');
+  const plans = getAllPlans();
+  list.innerHTML = plans.map(p => `
+    <div class="plan-card" onclick="showPlanDetail('${p.id}')" style="padding:14px 0;border-bottom:1px solid var(--rule);cursor:pointer">
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <span style="font-weight:600;font-size:15px">${esc(p.name)}</span>
+        ${p.id === state.currentPlanId ? '<span style="font-size:10px;color:var(--accent);font-weight:500">\u4F7F\u7528\u4E2D</span>' : ''}
+      </div>
+      <div style="font-size:12px;color:var(--muted);margin-top:4px">${esc(p.desc)}</div>
+      ${p.tags && p.tags.length ? `<div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
+        ${p.tags.map(t => `<span style="font-size:11px;color:var(--muted);background:var(--rule);padding:2px 8px;border-radius:4px">${esc(t)}</span>`).join('')}
+      </div>` : ''}
+    </div>
+  `).join('');
+}
+
+let detailPlanId = null;
+function showPlanDetail(id) {
+  const plan = getAllPlans().find(p => p.id === id);
+  if (!plan) return;
+  detailPlanId = id;
+  const isCustom = state.customPlans.some(p => p.id === id);
+  document.getElementById('planDetailName').textContent = plan.name;
+  document.getElementById('planDetailDesc').textContent = plan.desc || '';  document.getElementById('planDetailEditBtn').style.display = '';
+  document.getElementById('planDetailDeleteBtn').style.display = isCustom ? '' : 'none';
+  const btn = document.getElementById('planDetailApplyBtn');
+  if (plan.id === state.currentPlanId) {
+    btn.textContent = '\u5F53\u524D\u4F7F\u7528\u4E2D';
+    btn.style.opacity = '0.5';
+    btn.style.pointerEvents = 'none';
+  } else {
+    btn.textContent = '\u4F7F\u7528\u6B64\u8BA1\u5212';
+    btn.style.opacity = '1';
+    btn.style.pointerEvents = 'auto';
+  }
+  const content = document.getElementById('planDetailContent');
+  if (!plan.days || plan.days.length === 0) {
+    content.innerHTML = '<div style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px">\u6682\u65E0\u8BAD\u7EC3\u65E5</div>';
+  } else {
+    content.innerHTML = plan.days.map((day, i) => `
+      <div style="margin-bottom:20px">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--rule);margin-bottom:8px">
+          <span style="font-size:14px;font-weight:600">${esc(day.name)}</span>
+          <span style="font-size:11px;color:var(--muted)">${day.exercises.length} \u4E2A\u52A8\u4F5C</span>
+        </div>
+        ${day.exercises.length === 0 ? '<div style="padding:8px 0;color:var(--muted);font-size:12px">\u6682\u65E0\u52A8\u4F5C</div>' : day.exercises.map(ex => `
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0">
+            <span style="font-size:14px">${esc(ex.name)}</span>
+            <span style="font-size:12px;color:var(--muted)">${esc(ex.meta||'')}</span>
+          </div>
+        `).join('')}
+      </div>
+    `).join('');
+  }
+  document.querySelectorAll('.page-overlay').forEach(p => p.classList.remove('active'));
+  document.getElementById('pg-planDetail').classList.add('active');
+}
+
+function editPlanFromDetail() {
+  if (!detailPlanId) return;
+  const plan = getAllPlans().find(p => p.id === detailPlanId);
+  if (!plan) return;
+  document.querySelectorAll('.page-overlay').forEach(p => p.classList.remove('active'));
+  document.getElementById('pg-planEditor').classList.add('active');
+  document.getElementById('planEditorTitle').textContent = '\u7F16\u8F91\u8BA1\u5212';
+  document.getElementById('planName').value = plan.name;
+  document.getElementById('newDayName').value = '';
+  editorDays = plan.days.map(d => ({
+    name: d.name,
+    exercises: d.exercises.map(e => ({ ...e }))
+  }));
+  renderEditorDays();
+}
+
+function deletePlanFromDetail() {
+  if (!detailPlanId) return;
+  const idx = state.customPlans.findIndex(p => p.id === detailPlanId);
+  if (idx === -1) { toast('\u9884\u8BBE\u8BA1\u5212\u4E0D\u53EF\u5220\u9664'); return; }
+  if (!confirm('\u786E\u5B9A\u5220\u9664\u6B64\u8BA1\u5212\uFF1F')) return;
+  if (state.currentPlanId === detailPlanId) {
+    state.currentPlanId = 'ppl';
+    state.currentDayIdx = 0;
+  }
+  state.customPlans.splice(idx, 1);
+  saveState();
+  toast('\u8BA1\u5212\u5DF2\u5220\u9664');
+  renderPlanList();
+  renderExList();
+  showPage('plans');
+}
+
+function applyPlanFromDetail() {
+  if (detailPlanId) applyPlan(detailPlanId);
+}
+
+function applyPlan(id) {
+  state.currentPlanId = id;
+  state.currentDayIdx = 0;
+  saveState();
+  recordTodayToHistory();
+  toast('\u5DF2\u5207\u6362\u8BA1\u5212');
+  renderPlanList();
+  renderExList();
+  updateBurn();
+  showPage('home');
+}
+
+// Plan Editor
+let editorDays = [];
+let editingDayIdx = -1;
+
+function showPlanEditor(mode) {
+  document.querySelectorAll('.page-overlay').forEach(p => p.classList.remove('active'));
+  document.getElementById('pg-planEditor').classList.add('active');
+  document.getElementById('planEditorTitle').textContent = mode === 'new' ? '\u65B0\u5EFA\u8BA1\u5212' : '\u7F16\u8F91\u8BA1\u5212';
+  document.getElementById('planName').value = '';
+  document.getElementById('newDayName').value = '';
+  editorDays = [];
+  renderEditorDays();
+}
+
+function renderEditorDays() {
+  const container = document.getElementById('planDays');
+  if (editorDays.length === 0) {
+    container.innerHTML = '<div style="padding:16px 0;text-align:center;color:var(--muted);font-size:12px">\u6682\u65E0\u8BAD\u7EC3\u65E5\uFF0C\u5728\u4E0B\u65B9\u8F93\u5165\u540D\u79F0\u6DFB\u52A0</div>';
+    return;
+  }
+  container.innerHTML = editorDays.map((d, i) => {
+    const exCount = d.exercises.length;
+    const exNames = d.exercises.length > 0
+      ? d.exercises.map(e => e.name).join('\u3001')
+      : '\u6682\u65E0\u52A8\u4F5C';
+    return `
+      <div class="plan-day" style="padding:12px 0;border-bottom:1px solid var(--rule)">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:14px;font-weight:600">${esc(d.name)}</span>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:12px;color:var(--muted)">${exCount} \u4E2A\u52A8\u4F5C</span>
+            <button onclick="openDayEditor(${i})" style="font-size:12px;color:var(--text);font-weight:500">\u7F16\u8F91\u52A8\u4F5C</button>
+            <button onclick="removeEditorDay(${i})" style="font-size:12px;color:var(--danger)">\u5220\u9664</button>
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(exNames)}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+function addPlanDayInline() {
+  const input = document.getElementById('newDayName');
+  const name = input.value.trim();
+  if (!name) { toast('\u8BF7\u8F93\u5165\u8BAD\u7EC3\u65E5\u540D\u79F0'); return; }
+  editorDays.push({ name, exercises: [] });
+  input.value = '';
+  renderEditorDays();
+  toast('\u5DF2\u6DFB\u52A0\u8BAD\u7EC3\u65E5: ' + name);
+}
+
+function removeEditorDay(idx) {
+  editorDays.splice(idx, 1);
+  renderEditorDays();
+}
+
+function openDayEditor(idx) {
+  editingDayIdx = idx;
+  document.getElementById('dayEditorTitle').textContent = editorDays[idx].name + ' - \u52A8\u4F5C';
+  document.getElementById('dayExName').value = '';
+  renderDayExList();
+  openM('mdlDayEditor');
+}
+
+function renderDayExList() {
+  const container = document.getElementById('dayExList');
+  const day = editorDays[editingDayIdx];
+  if (!day) return;
+  if (day.exercises.length === 0) {
+    container.innerHTML = '<div style="text-align:center;padding:16px 0;color:var(--muted);font-size:13px">\u6682\u65E0\u52A8\u4F5C\uFF0C\u5728\u4E0B\u65B9\u6DFB\u52A0</div>';
+    return;
+  }
+  container.innerHTML = day.exercises.map((ex, i) => `
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--rule)">
+      <div>
+        <div style="font-size:14px">${esc(ex.name)}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">${esc(ex.meta)}</div>
+      </div>
+      <button onclick="removeEditorDayEx(${i})" style="font-size:12px;color:var(--danger)">\u5220\u9664</button>
+    </div>
+  `).join('');
+}
+
+function addExToEditorDay() {
+  const name = document.getElementById('dayExName').value.trim();
+  const wt = document.getElementById('dayExWt').value;
+  const sets = document.getElementById('dayExSets').value;
+  if (!name) { toast('\u8BF7\u8F93\u5165\u52A8\u4F5C\u540D\u79F0'); return; }
+  const meta = (wt && sets) ? wt + 'kg\u00d7' + sets : (wt ? wt + 'kg' : (sets ? sets + '\u7EC4' : '\u81EA\u5B9A\u4E49'));
+  editorDays[editingDayIdx].exercises.push({ name, meta, done: false });
+  document.getElementById('dayExName').value = '';
+  renderDayExList();
+  renderEditorDays();
+  toast('\u5DF2\u6DFB\u52A0: ' + name);
+}
+
+function removeEditorDayEx(idx) {
+  editorDays[editingDayIdx].exercises.splice(idx, 1);
+  renderDayExList();
+  renderEditorDays();
+}
+
+function savePlan() {
+  const name = document.getElementById('planName').value.trim() || '\u81EA\u5B9A\u4E49\u8BA1\u5212';
+  if (editorDays.length === 0) { toast('\u8BF7\u81F3\u5C11\u6DFB\u52A0\u4E00\u4E2A\u8BAD\u7EC3\u65E5'); return; }
+  const totalEx = editorDays.reduce((s, d) => s + d.exercises.length, 0);
+  const planData = {
+    name,
+    desc: editorDays.length + ' \u4E2A\u8BAD\u7EC3\u65E5 \u00b7 ' + totalEx + ' \u4E2A\u52A8\u4F5C',
+    tags: editorDays.filter(d => d.exercises.length > 0).map(d => d.name + ' ' + d.exercises.length + '\u52A8\u4F5C'),
+    days: editorDays.map(d => ({
+      name: d.name,
+      exercises: d.exercises.map(e => ({ ...e, done: false }))
+    }))
+  };
+  let updated = false;
+  if (detailPlanId) {
+    const presetIdx = state.plans.findIndex(p => p.id === detailPlanId);
+    if (presetIdx !== -1) {
+      state.plans[presetIdx] = { ...state.plans[presetIdx], ...planData };
+      updated = true;
+    } else {
+      const customIdx = state.customPlans.findIndex(p => p.id === detailPlanId);
+      if (customIdx !== -1) {
+        state.customPlans[customIdx] = { ...state.customPlans[customIdx], ...planData };
+        updated = true;
+      }
+    }
+  }
+  if (!updated) {
+    const newPlan = { id: 'custom_' + Date.now(), ...planData };
+    state.customPlans.push(newPlan);
+    detailPlanId = newPlan.id;
+  }
+  saveState();
+  renderPlanList();
+  if (state.currentPlanId === detailPlanId) renderExList();
+  toast(updated ? '\u8BA1\u5212\u5DF2\u66F4\u65B0: ' + name : '\u8BA1\u5212\u5DF2\u4FDD\u5B58: ' + name);
+  showPlanDetail(detailPlanId);
+}
+
+// ==================== PAGES ====================
+function showPage(p) {
+  document.querySelectorAll('.page-overlay').forEach(el => el.classList.remove('active'));
+  if (p === 'home') return;
+  const map = { progress:'pg-progress', profile:'pg-profile', plans:'pg-plans' };
+  if (map[p]) {
+    document.getElementById(map[p]).classList.add('active');
+    if (p === 'progress') initProgress();
+    if (p === 'profile') { updateGoalWeightHint(); updateWaterGoalDisplay(); }
+  }
+}
+
+// ==================== PROGRESS PAGE ====================
+function initProgress() {
+  recordTodayToHistory();
+  initHeatmap();
+  updateProgressStats();
+}
+
+function initHeatmap() {
+  const grid = document.getElementById('calHeatmap');
+  if (!grid) return;
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const firstDay = new Date(year, month, 1).getDay(); // 0=Sun
+  const today = now.getDate();
+  const monthNames = ['1\u6708','2\u6708','3\u6708','4\u6708','5\u6708','6\u6708','7\u6708','8\u6708','9\u6708','10\u6708','11\u6708','12\u6708'];
+
+  // Update label
+  const labelEl = document.getElementById('heatmapMonthLabel');
+  if (labelEl) labelEl.textContent = monthNames[month] + ' \u8BAD\u7EC3\u70ED\u5EA6';
+
+  const colors = ['var(--rule)','#ECD5CC','#DEAA98','#D07F64','var(--accent)'];
+  let html = '';
+  // Empty cells for days before the 1st
+  for (let i = 0; i < firstDay; i++) html += '<div></div>';
+
+  let trainedCount = 0;
+  for (let day = 1; day <= daysInMonth; day++) {
+    const dateStr = year + '-' + String(month+1).padStart(2,'0') + '-' + String(day).padStart(2,'0');
+    const h = state.history[dateStr];
+    let level = 0;
+    if (h && h.trained) {
+      trainedCount++;
+      // Level based on burn calories
+      const burn = h.burn || 0;
+      if (burn >= 300) level = 4;
+      else if (burn >= 200) level = 3;
+      else if (burn >= 100) level = 2;
+      else level = 1;
+    }
+    const isToday = day === today;
+    const isFuture = day > today;
+    html += `<div style="aspect-ratio:1;background:${colors[level]};font-size:8px;display:flex;align-items:center;justify-content:center;color:${level>2?'var(--bg)':'var(--muted)'};border-radius:3px;${isToday?'border:1px solid var(--accent);box-shadow:0 0 0 1px var(--accent);':''}${isFuture?'opacity:0.3;':''}">${day}</div>`;
+  }
+  grid.innerHTML = html;
+  document.getElementById('heatmapDaysLabel').textContent = trainedCount + '/' + daysInMonth + ' \u5929';
+  document.getElementById('monthTrain').textContent = trainedCount + ' \u5929';
+}
+
+function updateProgressStats() {
+  const now = new Date();
+  const today = todayKey();
+
+  // Week training count (current week, Mon-Sun)
+  const dayOfWeek = now.getDay() || 7; // 1=Mon, 7=Sun
+  const weekStart = new Date(now);
+  weekStart.setDate(now.getDate() - dayOfWeek + 1);
+  let weekTrained = 0;
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(weekStart);
+    d.setDate(weekStart.getDate() + i);
+    const dateStr = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+    if (state.history[dateStr] && state.history[dateStr].trained) weekTrained++;
+  }
+  document.getElementById('weekTrain').textContent = weekTrained + '/7';
+
+  // Total burn & intake (all history)
+  let totalBurn = 0, totalIntake = 0, totalTrainDays = 0;
+  Object.values(state.history).forEach(h => {
+    if (h.trained) {
+      totalBurn += h.burn || 0;
+      totalTrainDays++;
+    }
+    totalIntake += h.intake || 0;
+  });
+  // Include today's live data
+  const todayH = state.history[today];
+  if (todayH) {
+    // Already counted above since we record today to history
+  }
+  document.getElementById('totalBurn').textContent = totalBurn.toLocaleString() + ' kcal';
+  document.getElementById('totalIntake').textContent = totalIntake.toLocaleString() + ' kcal';
+  document.getElementById('totalTrain').textContent = totalTrainDays + ' \u5929';
+
+  // Weight change (from initial to current)
+  if (state.metrics && state.metrics.current) {
+    const initW = state.metrics.initial ? state.metrics.initial.weight : (state.metrics.previous ? state.metrics.previous.weight : state.metrics.current.weight);
+    const totalWd = state.metrics.current.weight - initW;
+    document.getElementById('weightChange').textContent = (totalWd>0?'+':'') + totalWd.toFixed(1) + ' kg';
+  } else {
+    document.getElementById('weightChange').textContent = '--';
+  }
+
+  // Streak days (consecutive training days ending today or yesterday)
+  let streak = 0;
+  let checkDate = new Date(now);
+  // Check today first
+  for (let i = 0; i < 365; i++) {
+    const d = new Date(checkDate);
+    d.setDate(checkDate.getDate() - i);
+    const dateStr = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+    const h = state.history[dateStr];
+    if (h && h.trained) {
+      streak++;
+    } else {
+      // Allow today to be untrained without breaking streak (only break if a past day is untrained)
+      if (i === 0) continue; // Today not trained yet, don't break streak
+      break;
+    }
+  }
+  document.getElementById('streakDays').textContent = streak + ' \u5929';
+}
+
+// ==================== DATA RESET ====================
+function resetAllData() {
+  if (!confirm('\u786E\u5B9A\u6E05\u7A7A\u6240\u6709\u6570\u636E\uFF1F\u6B64\u64CD\u4F5C\u4E0D\u53EF\u6062\u590D\uFF01')) return;
+  if (!confirm('\u518D\u6B21\u786E\u8BA4\uFF1A\u6240\u6709\u8BAD\u7EC3\u8BB0\u5F55\u3001\u8EAB\u4F53\u6570\u636E\u3001\u996E\u98DF\u8BB0\u5F55\u90FD\u5C06\u88AB\u5220\u9664\u3002')) return;
+  localStorage.removeItem(STORAGE_KEY);
+  state = defaultState();
+  saveState();
+  renderAll();
+  showPage('home');
+  toast('\u6240\u6709\u6570\u636E\u5DF2\u6E05\u7A7A');
+  setTimeout(() => openM('mdlMetric'), 300);
+}
+
+// ==================== MODAL HELPERS ====================
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function openM(id) { document.getElementById(id).classList.add('active'); }
+function closeM(id) { document.getElementById(id).classList.remove('active'); }
+
+function toast(m) {
+  const t = document.getElementById('toast');
+  t.textContent = m;
+  t.classList.add('show');
+  clearTimeout(t._t);
+  t._t = setTimeout(() => { t.classList.remove('show'); }, 1500);
+}
+
+// Close modal on overlay click
+document.addEventListener('click', e => {
+  if (e.target.classList && e.target.classList.contains('overlay')) {
+    e.target.classList.remove('active');
+  }
+});
+
+// Start
+init();
+</script>
+</body>
+</html>
+.day-switch{display:inline-flex;align-items:center;gap:2px;cursor:pointer}
+.day-switch__label{font-size:9px;color:var(--muted);margin-left:4px}
+.day-switch__arrow{font-size:10px;color:var(--muted)}
+
+/* --- WATER --- */
+.water{display:flex;align-items:center;justify-content:center;gap:0;padding:10px 0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);margin-top:auto;flex-shrink:0}
+.water__btn{width:36px;height:36px;border-radius:50%;border:1.5px solid var(--rule);display:flex;align-items:center;justify-content:center;font-size:18px;color:var(--text);flex-shrink:0;transition:all .12s;line-height:1}
+.water__btn:active{background:var(--text);color:var(--bg);border-color:var(--text)}
+.water__mid{text-align:center;padding:0 20px}
+.water__val{font-size:32px;font-weight:600;letter-spacing:-0.03em;line-height:1}
+.water__goal{font-size:11px;color:var(--muted);margin-top:2px}
+.water__bar{width:120px;height:4px;background:var(--rule);margin:6px auto 0}
+.water__bar-f{height:100%;background:var(--accent);transition:width .2s}
+
+/* --- PAGE OVERLAY --- */
+.page-overlay{position:absolute;inset:0;background:var(--bg);z-index:10;padding:20px;overflow-y:auto;display:none;max-width:420px;left:50%;transform:translateX(-50%);width:100%}
+.page-overlay.active{display:block}
+
+/* --- MODAL --- */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.3);backdrop-filter:blur(3px);z-index:200;display:flex;align-items:flex-end;justify-content:center;opacity:0;pointer-events:none;transition:opacity .2s}
+.overlay.active{opacity:1;pointer-events:auto}
+.sheet{background:var(--bg);width:100%;max-width:420px;border-radius:20px 20px 0 0;padding:28px 24px;max-height:70dvh;overflow-y:auto;transform:translateY(20px);transition:transform .2s}
+.overlay.active .sheet{transform:translateY(0)}
+.sheet__title{font-size:20px;font-weight:600;margin-bottom:24px;letter-spacing:-0.01em}
+.fg{margin-bottom:14px}
+.fg__lbl{display:block;font-size:11px;font-weight:600;color:var(--muted);margin-bottom:6px;letter-spacing:.04em;text-transform:uppercase}
+.fg__inp{width:100%;padding:14px 0;border:none;border-bottom:1.5px solid var(--rule);font-size:18px;background:transparent;outline:none;font-family:inherit;color:var(--text)}
+.fg__inp:focus{border-color:var(--text)}
+.fg__row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.btn{display:inline-flex;align-items:center;justify-content:center;padding:14px 28px;font-size:15px;font-weight:500;letter-spacing:-0.01em}
+.btn:active{opacity:.6}
+.btn--pri{background:var(--text);color:var(--bg)}
+.btn--fw{width:100%}
+.sheet .meal-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--rule);cursor:pointer;font-size:14px}
+.sheet .meal-row:active{background:var(--rule)}
+.sheet .meal-row__cals{font-size:12px;color:var(--muted)}
+
+/* Goal Selector */
+.goal-sel{transition:all .15s}
+.goal-sel.active{border-color:var(--text)!important;background:var(--text)!important;color:var(--bg)!important}
+.goal-sel.active div:last-child{color:rgba(255,255,255,.6)!important}
+
+/* Plan Card */
+.plan-card{transition:background .12s}
+.plan-card:active{background:rgba(0,0,0,.02)}
+[data-theme="dark"] .plan-card:active{background:rgba(255,255,255,.03)}
+
+/* Back button */
+.back-btn{font-size:13px;color:var(--muted);margin-bottom:16px}
+.back-btn:active{opacity:.6}
+
+/* Toast */
+.toast{position:fixed;bottom:40px;left:50%;transform:translateX(-50%) translateY(0);background:var(--text);color:var(--bg);padding:8px 20px;font-size:13px;font-weight:500;z-index:999;white-space:nowrap;transition:all .2s;opacity:0;pointer-events:none;border-radius:8px}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(-6px)}
+
+/* Progress bar for intake */
+.intake-bar{width:100%;height:3px;background:var(--rule);margin-top:4px;border-radius:2px}
+.intake-bar__f{height:100%;background:var(--accent);border-radius:2px;transition:width .3s}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <!-- TOP -->
+  <div class="top">
+    <span><span class="top__date" id="topDate">8月12日</span><span class="top__day" id="topDay">周三</span></span>
+    <span class="top__nav">
+      <button onclick="showPage('plans')">计划</button>
+      <button onclick="showPage('progress')">进度</button>
+      <button onclick="showPage('profile')">我的</button>
+      <button class="top__theme" onclick="toggleTheme()" id="themeBtn" aria-label="切换主题"><svg class="top__theme-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
+    </span>
+  </div>
+
+  <!-- STATS -->
+  <div class="stats">
+    <div class="stat--accent" style="flex:1">
+      <div class="stat__num" id="intakeNum">0</div>
+      <div class="stat__lbl" id="intakeLbl">摄入/1,630</div>
+      <div class="intake-bar"><div class="intake-bar__f" id="intakeBar" style="width:0%"></div></div>
+    </div>
+    <div style="flex:1">
+      <div class="stat__num" id="burnNum">0</div>
+      <div class="stat__lbl">消耗 kcal</div>
+    </div>
+    <div style="flex:0.7;cursor:pointer" onclick="changeWater(1)">
+      <div class="stat__num" id="waterNum">0</div>
+      <div class="stat__lbl">饮水 ml</div>
+    </div>
+  </div>
+
+  <!-- MAIN: training + meals side by side -->
+  <div class="main">
+    <!-- Training -->
+    <div class="col">
+      <div class="col__head">
+        <span style="display:flex;align-items:center">
+          <span class="col__title" style="cursor:pointer" onclick="showPage('plans')">训练</span>
+          <span class="day-switch" onclick="switchDay(1)">
+            <span class="day-switch__label" id="planLabel">推日</span>
+            <span class="day-switch__arrow">▾</span>
+          </span>
+        </span>
+        <span class="col__add" onclick="openM('mdlEx')">+</span>
+      </div>
+      <div class="col__list" id="exList"></div>
+    </div>
+    <!-- Diet -->
+    <div class="col">
+      <div class="col__head"><span class="col__title">饮食</span><span class="col__add" onclick="openFoodModal()">+</span></div>
+      <div class="col__list" id="mealList"></div>
+    </div>
+  </div>
+
+  <!-- WATER -->
+  <div class="water">
+    <button class="water__btn" onclick="changeWater(-1)">&minus;</button>
+    <div class="water__mid">
+      <div class="water__val" id="waterVal">0</div>
+      <div class="water__goal" id="waterGoal">ml / 2,000</div>
+      <div class="water__bar"><div class="water__bar-f" id="waterBar" style="width: 0%;"></div></div>
+    </div>
+    <button class="water__btn" onclick="changeWater(1)">+</button>
+  </div>
+
+  <!-- PROGRESS -->
+  <div id="pg-progress" class="page-overlay">
+    <button class="back-btn" onclick="showPage('home')" style="font-size: 17px;">&larr; 返回</button>
+    <div style="font-size:20px;font-weight:600;margin-bottom:20px">进度</div>
+    <div style="margin-bottom:20px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+        <span style="font-size:11px;font-weight:600;color:var(--muted);letter-spacing:.06em;text-transform:uppercase" id="heatmapMonthLabel">训练热度</span>
+        <span style="font-size:10px;color:var(--muted)" id="heatmapDaysLabel">0/0 天</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:4px" id="calHeatmap"></div>
+      <div style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:10px;color:var(--muted)">
+        <span>少</span>
+        <span style="width:10px;height:10px;background:var(--rule);border-radius:2px"></span>
+        <span style="width:10px;height:10px;background:#ECD5CC;border-radius:2px"></span>
+        <span style="width:10px;height:10px;background:#DEAA98;border-radius:2px"></span>
+        <span style="width:10px;height:10px;background:#D07F64;border-radius:2px"></span>
+        <span style="width:10px;height:10px;background:var(--accent);border-radius:2px"></span>
+        <span>多</span>
+      </div>
+    </div>
+    <div style="display:flex;align-items:baseline;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--rule)"><span>本周训练</span><span style="font-size:24px;font-weight:600;color:var(--accent)" id="weekTrain">0/7</span></div>
+    <div style="display:flex;align-items:baseline;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--rule)"><span>总消耗</span><span style="font-size:24px;font-weight:600" id="totalBurn">0 kcal</span></div>
+    <div style="display:flex;align-items:baseline;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--rule)"><span>总摄入</span><span style="font-size:24px;font-weight:600" id="totalIntake">0 kcal</span></div>
+    <div style="display:flex;align-items:baseline;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--rule)"><span>体重变化</span><span style="font-size:24px;font-weight:600" id="weightChange">0.0 kg</span></div>
+    <div style="margin-top:24px;display:flex;align-items:baseline;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--rule)"><span>本月训练</span><span style="font-size:24px;font-weight:600" id="monthTrain">0 天</span></div>
+    <div style="display:flex;align-items:baseline;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--rule)"><span>连续打卡</span><span style="font-size:24px;font-weight:600" id="streakDays">0 天</span></div>
+    <div style="display:flex;align-items:baseline;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--rule)"><span>累计训练</span><span style="font-size:24px;font-weight:600" id="totalTrain">0 天</span></div>
+  </div>
+
+  <!-- PROFILE -->
+  <div id="pg-profile" class="page-overlay">
+    <button class="back-btn" onclick="showPage('home')" style="font-size: 17px;">&larr; 返回</button>
+
+    <div style="font-size: 20px; font-weight: 600; color: var(--muted); letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 10px;">目标体重</div>
+    <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:8px">
+      <input class="fg__inp" type="number" id="goalWeightInput" value="70" step="0.5" style="font-size:32px;font-weight:600;width:120px;padding:8px 0">
+      <span style="font-size:16px;color:var(--muted)">kg</span>
+      <button class="btn btn--pri" style="margin-left:auto;padding:10px 20px;font-size:14px" onclick="saveGoalWeight()">设置</button>
+    </div>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:24px" id="goalWeightHint">当前 72.5 kg &rarr; 目标 69.0 kg (-3.5 kg) &middot; 建议 1,630 kcal/天</div>
+
+    <div style="font-size:11px;font-weight:600;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px">饮水目标</div>
+    <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:24px">
+      <input class="fg__inp" type="number" id="waterGoalInput" value="2000" step="100" style="font-size:24px;font-weight:600;width:100px;padding:8px 0">
+      <span style="font-size:14px;color:var(--muted)">ml/天</span>
+      <button class="btn btn--pri" style="margin-left:auto;padding:10px 20px;font-size:14px" onclick="saveWaterGoal()">设置</button>
+    </div>
+
+    <div style="font-size:11px;font-weight:600;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px">身体数据 <button style="font-size:11px;color:var(--text);font-weight:400;margin-left:8px;text-transform:none;letter-spacing:0" onclick="openM('mdlMetric')">+ 记录</button></div>
+    <div style="display:flex;align-items:baseline;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--rule)"><span>体重</span><span><span style="font-size:16px;font-weight:600" id="weightVal">--</span> kg <span style="font-size: 11px; color: var(--accent);" id="weightDiff"></span></span></div>
+    <div style="display:flex;align-items:baseline;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--rule)"><span>体脂率</span><span><span style="font-size:16px;font-weight:600" id="bodyFatVal">--</span>% <span style="font-size: 11px; color: var(--accent);" id="bodyFatDiff"></span></span></div>
+    <div style="display:flex;align-items:baseline;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--rule)"><span>骨骼肌</span><span><span style="font-size:16px;font-weight:600" id="muscleVal">--</span> kg <span style="font-size: 11px; color: var(--accent);" id="muscleDiff"></span></span></div>
+
+    <div style="margin-top:24px;font-size:11px;font-weight:600;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px">数据管理</div>
+    <button class="btn btn--fw" style="color:var(--danger);border:1.5px solid var(--rule);margin-bottom:8px" onclick="resetAllData()">清空所有数据</button>
+  </div>
+
+  <!-- PLANS -->
+  <div id="pg-plans" class="page-overlay">
+    <button class="back-btn" onclick="showPage('home')" style="font-size: 17px;">&larr; 返回</button>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
+      <span style="font-size:20px;font-weight:600">训练计划</span>
+      <button style="font-size:13px;color:var(--text);font-weight:500" onclick="detailPlanId=null;showPlanEditor('new')">+ 新建</button>
+    </div>
+    <div id="planList"></div>
+  </div>
+
+  <!-- PLAN DETAIL -->
+  <div id="pg-planDetail" class="page-overlay">
+    <button class="back-btn" onclick="showPage('plans')" style="font-size: 17px;">&larr; 返回</button>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+      <span style="font-size:20px;font-weight:600" id="planDetailName">推拉腿训练</span>
+      <button style="font-size: 18px; color: var(--text); font-weight: 500;" onclick="editPlanFromDetail()" id="planDetailEditBtn">编辑</button>
+    </div>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:20px" id="planDetailDesc">每周 6 天 &middot; 增肌 &middot; 推/拉/腿</div>
+    <div id="planDetailContent"></div>
+    <div style="display:flex;gap:12px;margin-top:24px">
+      <button class="btn" style="flex: 1 1 0%; color: var(--muted); border: 1.5px solid var(--rule); display: none;" onclick="deletePlanFromDetail()" id="planDetailDeleteBtn">删除计划</button>
+      <button class="btn btn--pri btn--fw" style="flex: 2 1 0%; opacity: 0.5; pointer-events: none;" onclick="applyPlanFromDetail()" id="planDetailApplyBtn">当前使用中</button>
+    </div>
+  </div>
+
+  <!-- PLAN EDITOR -->
+  <div id="pg-planEditor" class="page-overlay">
+    <button class="back-btn" onclick="showPage('plans')" style="font-size: 17px;">&larr; 返回</button>
+    <div style="font-size:20px;font-weight:600;margin-bottom:20px" id="planEditorTitle">新建计划</div>
+    <div class="fg"><label class="fg__lbl">计划名称</label><input class="fg__inp" placeholder="输入计划名" id="planName" style="width:100%"></div>
+    <div style="font-size:11px;font-weight:600;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;margin:16px 0 8px">训练日</div>
+    <div id="planDays"></div>
+    <div style="display:flex;gap:8px;margin-top:12px;align-items:center">
+      <input class="fg__inp" placeholder="训练日名称（如：推日）" id="newDayName" style="flex:1;font-size:15px;padding:10px 0">
+      <button class="btn btn--pri" style="padding:10px 16px;font-size:13px;flex-shrink:0" onclick="addPlanDayInline()">添加</button>
+    </div>
+    <div style="display:flex;gap:12px;margin-top:32px">
+      <button class="btn" style="flex:1;color:var(--muted)" onclick="showPage('plans')">取消</button>
+      <button class="btn btn--pri btn--fw" style="flex:2" onclick="savePlan()">保存计划</button>
+    </div>
+  </div>
+
+  <!-- PLAN DAY EXERCISE EDITOR MODAL -->
+  <div class="overlay" id="mdlDayEditor">
+    <div class="sheet">
+      <div class="sheet__title" id="dayEditorTitle">拉日 - 动作</div>
+      <div id="dayExList" style="margin-bottom:16px"></div>
+      <div style="border-top:1px solid var(--rule);padding-top:16px">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);letter-spacing:.04em;text-transform:uppercase;margin-bottom:10px">添加动作</div>
+        <div class="fg"><label class="fg__lbl">动作名称</label><input class="fg__inp" placeholder="如：杠铃卧推" id="dayExName"></div>
+        <div class="fg__row">
+          <div class="fg"><label class="fg__lbl">重量</label><input class="fg__inp" type="number" value="20" step="0.5" id="dayExWt"></div>
+          <div class="fg"><label class="fg__lbl">组数</label><input class="fg__inp" type="number" value="4" id="dayExSets"></div>
+        </div>
+        <button class="btn btn--fw" style="margin-top:8px;color:var(--text);border:1.5px solid var(--rule)" onclick="addExToEditorDay()">+ 添加动作</button>
+      </div>
+      <button class="btn btn--pri btn--fw" style="margin-top:16px" onclick="closeM('mdlDayEditor')">完成</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODALS -->
+<div class="overlay" id="mdlEx">
+  <div class="sheet"><div class="sheet__title">添加训练</div>
+    <div class="fg"><label class="fg__lbl">动作</label><input class="fg__inp" placeholder="动作名称" id="exName"></div>
+    <div class="fg__row"><div class="fg"><label class="fg__lbl">重量</label><input class="fg__inp" type="number" value="20" step="0.5" id="exWt"></div><div class="fg"><label class="fg__lbl">组数</label><input class="fg__inp" type="number" value="4" id="exSets"></div></div>
+    <div style="display:flex;gap:12px;margin-top:24px"><button class="btn" style="flex:1;color:var(--muted)" onclick="closeM('mdlEx')">取消</button><button class="btn btn--pri btn--fw" style="flex:2" onclick="addEx()">确认</button></div>
+  </div>
+</div>
+
+<div class="overlay" id="mdlFood">
+  <div class="sheet"><div class="sheet__title">添加食物</div>
+    <div style="display:flex;gap:2px;margin-bottom:16px;background:var(--rule);padding:2px;border-radius:8px" id="mealTypeSel">
+      <div style="flex:1;text-align:center;padding:8px 0;font-size:12px;font-weight:500;cursor:pointer;background:var(--bg);color:var(--text);border-radius:6px" data-type="breakfast" onclick="selectMealType(this)">早餐</div>
+      <div style="flex:1;text-align:center;padding:8px 0;font-size:12px;font-weight:500;cursor:pointer;color:var(--muted)" data-type="lunch" onclick="selectMealType(this)">午餐</div>
+      <div style="flex:1;text-align:center;padding:8px 0;font-size:12px;font-weight:500;cursor:pointer;color:var(--muted)" data-type="dinner" onclick="selectMealType(this)">晚餐</div>
+      <div style="flex:1;text-align:center;padding:8px 0;font-size:12px;font-weight:500;cursor:pointer;color:var(--muted)" data-type="snack" onclick="selectMealType(this)">加餐</div>
+    </div>
+    <div style="border:1.5px solid var(--rule);border-radius:10px;padding:12px;margin-bottom:16px">
+      <div style="font-size:11px;font-weight:600;color:var(--muted);letter-spacing:.04em;text-transform:uppercase;margin-bottom:10px">手动添加</div>
+      <div style="display:flex;gap:8px;align-items:flex-end">
+        <div style="flex:1"><input class="fg__inp" placeholder="食物名称" id="manualFoodName" style="font-size:15px;padding:8px 0"></div>
+        <div style="width:90px"><input class="fg__inp" type="number" placeholder="热量" id="manualFoodCal" style="font-size:15px;padding:8px 0"></div>
+        <span style="font-size:12px;color:var(--muted);padding-bottom:10px">kcal</span>
+      </div>
+    </div>
+    <div style="font-size:11px;font-weight:600;color:var(--muted);letter-spacing:.04em;text-transform:uppercase;margin-bottom:8px">快捷选择</div>
+    <div id="foodPickList">
+      <div class="meal-row" onclick="toggleFoodPick(this,'鸡胸肉',165)"><span>鸡胸肉</span><span class="meal-row__cals">165 kcal</span></div>
+      <div class="meal-row" onclick="toggleFoodPick(this,'糙米饭',123)"><span>糙米饭</span><span class="meal-row__cals">123 kcal</span></div>
+      <div class="meal-row" onclick="toggleFoodPick(this,'西兰花',34)"><span>西兰花</span><span class="meal-row__cals">34 kcal</span></div>
+      <div class="meal-row" onclick="toggleFoodPick(this,'鸡蛋×2',155)"><span>鸡蛋 ×2</span><span class="meal-row__cals">155 kcal</span></div>
+      <div class="meal-row" onclick="toggleFoodPick(this,'蛋白粉',120)"><span>蛋白粉</span><span class="meal-row__cals">120 kcal</span></div>
+      <div class="meal-row" onclick="toggleFoodPick(this,'香蕉',89)"><span>香蕉</span><span class="meal-row__cals">89 kcal</span></div>
+      <div class="meal-row" onclick="toggleFoodPick(this,'燕麦片',150)"><span>燕麦片</span><span class="meal-row__cals">150 kcal</span></div>
+      <div class="meal-row" onclick="toggleFoodPick(this,'牛排',250)"><span>牛排</span><span class="meal-row__cals">250 kcal</span></div>
+    </div>
+    <div id="foodPickSummary" style="font-size:12px;color:var(--muted);margin-top:12px;min-height:16px"></div>
+    <div style="display:flex;gap:12px;margin-top:16px"><button class="btn" style="flex:1;color:var(--muted)" onclick="closeM('mdlFood')">取消</button><button class="btn btn--pri btn--fw" style="flex:2" onclick="confirmAddFood()">确认添加</button></div>
+  </div>
+</div>
+
+<div class="overlay" id="mdlMetric">
+  <div class="sheet"><div class="sheet__title">身体数据</div>
+    <div class="fg"><label class="fg__lbl">体重 (kg)</label><input class="fg__inp" type="number" id="mWeight" placeholder="如 72.5" step="0.1"></div>
+    <div class="fg"><label class="fg__lbl">体脂率 (%)</label><input class="fg__inp" type="number" id="mBodyFat" placeholder="如 16.8" step="0.1"></div>
+    <div class="fg"><label class="fg__lbl">骨骼肌 (kg)</label><input class="fg__inp" type="number" id="mMuscle" placeholder="如 34.2" step="0.1"></div>
+    <div style="display:flex;gap:12px;margin-top:24px"><button class="btn" style="flex:1;color:var(--muted)" onclick="closeM('mdlMetric')">取消</button><button class="btn btn--pri btn--fw" style="flex:2" onclick="saveMetric()">保存</button></div>
+  </div>
+</div>
+
+<div class="overlay" id="mdlMeal">
+  <div class="sheet"><div class="sheet__title" id="mealTitle">早餐</div>
+    <div id="mealItems"></div>
+    <button class="btn btn--fw" style="margin-top:16px;color:var(--text);border:1.5px solid var(--rule)" onclick="closeM('mdlMeal')">关闭</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ==================== DATA STORAGE ====================
+const STORAGE_KEY = 'fitflow_data_v2';
+const THEME_KEY = 'fitflow_theme';
+const todayKey = () => {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+};
+
+const DEFAULT_GOAL_WEIGHT = 70;
+const DEFAULT_WATER_GOAL = 2000;
+
+const DEFAULT_PLANS = [
+  { id: 'ppl', name: '推拉腿训练', desc: '每周 6 天 \u00b7 增肌 \u00b7 推/拉/腿', tags: ['推日 4动作','拉日 5动作','腿日 5动作'],
+    days: [
+      { name: '推日', exercises: [
+        { name: '杠铃卧推', meta: '80kg', done: false },
+        { name: '上斜卧推', meta: '28kg', done: false },
+        { name: '器械飞鸟', meta: '18kg', done: false },
+        { name: '臂屈伸', meta: '15kg', done: false }
+      ]},
+      { name: '拉日', exercises: [
+        { name: '引体向上', meta: '自重', done: false },
+        { name: '硬拉', meta: '100kg', done: false },
+        { name: '划船', meta: '40kg', done: false },
+        { name: '面拉', meta: '15kg', done: false },
+        { name: '二头弯举', meta: '12kg', done: false }
+      ]},
+      { name: '腿日', exercises: [
+        { name: '深蹲', meta: '80kg', done: false },
+        { name: '箭步蹲', meta: '20kg', done: false },
+        { name: '腿举', meta: '120kg', done: false },
+        { name: '腿屈伸', meta: '30kg', done: false },
+        { name: '小腿提踵', meta: '40kg', done: false }
+      ]}
+    ]
+  },
+  { id: '5x5', name: '5\u00d75 力量训练', desc: '每周 3 天 \u00b7 增力 \u00b7 初学者友好', tags: [],
+    days: [
+      { name: '训练A', exercises: [
+        { name: '深蹲', meta: '60kg', done: false },
+        { name: '卧推', meta: '50kg', done: false },
+        { name: '划船', meta: '40kg', done: false }
+      ]},
+      { name: '训练B', exercises: [
+        { name: '深蹲', meta: '60kg', done: false },
+        { name: '站姿推举', meta: '30kg', done: false },
+        { name: '硬拉', meta: '80kg', done: false }
+      ]}
+    ]
+  },
+  { id: 'hiit', name: '减脂 HIIT', desc: '每周 4 天 \u00b7 每次 30 分钟', tags: [],
+    days: [
+      { name: 'HIIT Day', exercises: [
+        { name: '波比跳', meta: '30秒\u00d74', done: false },
+        { name: '高抬腿', meta: '30秒\u00d74', done: false },
+        { name: '登山跑', meta: '30秒\u00d74', done: false },
+        { name: '开合跳', meta: '30秒\u00d74', done: false }
+      ]}
+    ]
+  },
+  { id: 'ul', name: '上下肢分化', desc: '每周 4 天 \u00b7 增肌', tags: [],
+    days: [
+      { name: '上肢日', exercises: [
+        { name: '卧推', meta: '60kg', done: false },
+        { name: '划船', meta: '40kg', done: false },
+        { name: '推举', meta: '30kg', done: false },
+        { name: '二头弯举', meta: '12kg', done: false }
+      ]},
+      { name: '下肢日', exercises: [
+        { name: '深蹲', meta: '80kg', done: false },
+        { name: '硬拉', meta: '100kg', done: false },
+        { name: '箭步蹲', meta: '20kg', done: false }
+      ]}
+    ]
+  }
+];
+
+const DEFAULT_MEALS = {
+  breakfast: { name: '早餐', items: [] },
+  lunch: { name: '午餐', items: [] },
+  dinner: { name: '晚餐', items: [] },
+  snack: { name: '加餐', items: [] }
+};
+
+const DEFAULT_METRICS = {
+  current: null,
+  previous: null,
+  initial: null
+};
+
+let state = loadState();
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const s = JSON.parse(raw);
+      if (s.goalWeight === undefined) s.goalWeight = DEFAULT_GOAL_WEIGHT;
+      if (s.waterGoal === undefined) s.waterGoal = DEFAULT_WATER_GOAL;
+      if (!s.history) s.history = {};
+      if (!s.lastActiveDate) s.lastActiveDate = todayKey();
+      if (!s.metrics || !s.metrics.current) s.metrics = JSON.parse(JSON.stringify(DEFAULT_METRICS));
       return s;
     }
   } catch(e) { console.warn('load state failed', e); }
